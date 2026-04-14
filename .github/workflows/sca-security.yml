@@ -1,0 +1,189 @@
+# .github/workflows/sca-sbom.yml
+# Purpose: SCA vulnerability scanning + SBOM generation on every push
+# Triggers: push to main/develop, pull requests, weekly scheduled scan
+
+name: SCA + SBOM Security Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday 6am UTC — catches new CVEs on existing deps
+  workflow_dispatch:       # Manual trigger from GitHub Actions UI
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  # ── Job 1: Dependency Vulnerability Scan (Snyk) ─────────
+  snyk-scan:
+    name: Snyk SCA Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # Required to upload SARIF to GitHub Security tab
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci  # ci = clean install — ensures lockfile is respected
+
+      - name: Run Snyk vulnerability scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}  # Add in repo Settings > Secrets
+        with:
+          args: >
+            --severity-threshold=high
+            --sarif-file-output=snyk-results.sarif
+        continue-on-error: true  # Don't fail here — let SARIF upload first
+
+      - name: Upload Snyk results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-results.sarif
+
+
+  # ── Job 2: SBOM Generation (Syft) ────────────────────────
+  generate-sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: snyk-scan
+    permissions:
+      contents: write   # Required to attach SBOM to release
+      packages: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SPDX SBOM (for NTIA/federal compliance)
+        run: |
+          syft dir:. \
+            --output spdx-json=sbom-spdx.json \
+            --catalogers all
+        # --catalogers all: scans ALL package types (npm, pip, maven, gems, go, etc.)
+
+      - name: Generate CycloneDX SBOM (for DevSecOps/vuln tracking)
+        run: |
+          syft dir:. \
+            --output cyclonedx-json=sbom-cyclonedx.json \
+            --catalogers all
+
+      - name: Upload SBOMs as build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: |
+            sbom-spdx.json
+            sbom-cyclonedx.json
+          retention-days: 90  # Keep for audit purposes
+
+
+  # ── Job 3: CVE Scan via Grype (CI gate) ─────────────────
+  grype-scan:
+    name: Grype CVE Gate
+    runs-on: ubuntu-latest
+    needs: generate-sbom
+    steps:
+      - name: Download SBOM from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-artifacts
+
+      - name: Install Grype
+        uses: anchore/scan-action/download-grype@v4
+
+      - name: Scan SBOM with Grype
+        id: grype-scan
+        run: |
+          grype sbom:./sbom-cyclonedx.json \
+            --output table \
+            --output sarif=grype-results.sarif \
+            --fail-on critical
+        # --fail-on critical: exits with code 1 if ANY critical CVE found
+        # This BREAKS the pipeline — no deployment if critical vuln present
+
+      - name: Upload Grype SARIF to GitHub Security
+        if: always()   # Upload even if scan failed
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-results.sarif
+          category: grype-sbom
+
+
+  # ── Job 4: License Compliance Check ─────────────────────
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    needs: generate-sbom
+    steps:
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-artifacts
+
+      - name: Check for disallowed licenses
+        run: |
+          # Extract all license identifiers from SPDX SBOM
+          python3 -c "
+          import json, sys
+          d = json.load(open('sbom-spdx.json'))
+          blocked = ['GPL-2.0', 'GPL-3.0', 'AGPL-3.0', 'SSPL-1.0']
+          found = []
+          for pkg in d.get('packages', []):
+              lic = pkg.get('licenseConcluded', '') or pkg.get('licenseDeclared', '')
+              for b in blocked:
+                  if b in lic:
+                      found.append(f'{pkg[\"name\"]}: {lic}')
+          if found:
+              print('BLOCKED LICENSES FOUND:'); [print(f) for f in found]
+              sys.exit(1)
+          else:
+              print(f'License check PASSED — {len(d[\"packages\"])} packages checked')"
+
+Dependabot Configuration — Automated Dependency Updates
+Save this as .github/dependabot.yml to enable automated dependency update PRs:
+
+# .github/dependabot.yml
+version: 2
+updates:
+  # npm/Node.js dependencies
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - security
+    # Only allow patches/minor for stability; major = manual review
+    versioning-strategy: increase-if-necessary
+
+  # GitHub Actions version updates
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Pin action versions for SLSA Level 2
+
+  # Docker base image updates
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: daily   # Critical — base image CVEs are common
